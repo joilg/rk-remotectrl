@@ -1,39 +1,51 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include <linux/arm-smccc.h>
 #include <linux/clk.h>
 #include <linux/io.h>
 #include <linux/irq.h>
-#include <linux/irqdesc.h>
 #include <linux/irqdomain.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
-#include <linux/module.h>
-#include <linux/timer.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
-#include <linux/platform_device.h>
 #include <linux/input.h>
 #include <linux/workqueue.h>
-#include <linux/pm_wakeup.h>
 #include <linux/slab.h>
+#include <linux/pm_wakeup.h>
 #include "rockchip_pwm_remotectl.h"
 
+/*
+ * Rockchip SIP remotectl firmware interface.
+ *
+ * The vendor tree implements sip_smc_remotectl_config() in
+ * drivers/firmware/rockchip_sip.c on top of the non-standard SMC
+ * call SIP_REMOTECTL_CFG (0x8200000b). The mainline kernel does not
+ * carry the Rockchip SIP layer, so the call is issued directly here
+ * with the same register layout. If the running ATF does not implement
+ * the call, res.a0 is non-zero and the driver keeps using the in-kernel
+ * PWM capture path - the same fallback behaviour as the vendor tree.
+ */
+#define SIP_REMOTECTL_CFG		0x8200000b
 
-#define REMOTECTL_SET_IRQ            0
-#define REMOTECTL_SET_PWM_CH         0
-#define REMOTECTL_SET_PWRKEY         0
-#define REMOTECTL_ENABLE             0
-#define REMOTECTL_GET_WAKEUP_STATE   0
-#define REMOTECTL_PWRKEY_WAKEUP      999
+/* SIP_REMOTECTL_CFG call types */
+#define REMOTECTL_SET_IRQ		0xf0
+#define REMOTECTL_SET_PWM_CH		0xf1
+#define REMOTECTL_SET_PWRKEY		0xf2
+#define REMOTECTL_GET_WAKEUP_STATE	0xf3
+#define REMOTECTL_ENABLE		0xf4
+#define REMOTECTL_PWRKEY_WAKEUP		0xdeadbeaf
 
-static inline int sip_smc_remotectl_config(unsigned long a, unsigned long b)
+static int sip_smc_remotectl_config(u32 func, u32 data)
 {
-	/* Immer einen Fehler zurückgeben, damit der Treiber auf den Standard-Kernel-Pfad ausweicht */
-	return -EINVAL; 
-}
+	struct arm_smccc_res res;
 
+	arm_smccc_smc(SIP_REMOTECTL_CFG, func, data, 0, 0, 0, 0, 0, &res);
+
+	return res.a0;
+}
 
 /*
  * sys/module/rk_pwm_remotectl/parameters,
@@ -134,7 +146,8 @@ struct rkxx_remotectl_drvdata {
 	struct input_dev *input;
 	struct timer_list timer;
 	struct tasklet_struct remote_tasklet;
-	struct wakeup_source *remotectl_wake_lock;
+	struct device *dev;
+	bool irq_wake_enabled;
 	const struct rk_remote_pwm_data *pwm_data;
 };
 
@@ -386,7 +399,10 @@ static void rk_pwm_remotectl_do_something(unsigned long  data)
 
 static void rk_pwm_remotectl_timer(struct timer_list *t)
 {
-	struct rkxx_remotectl_drvdata *ddata = container_of(t, struct rkxx_remotectl_drvdata, timer);
+	/* from_timer() was removed in v7.3; plain container_of is the
+	 * pattern used by in-tree timer callbacks nowadays */
+	struct rkxx_remotectl_drvdata *ddata =
+		container_of(t, struct rkxx_remotectl_drvdata, timer);
 
 	if (ddata->press != ddata->pre_press) {
 		ddata->pre_press = 0;
@@ -455,8 +471,8 @@ static irqreturn_t rockchip_pwm_irq(int irq, void *dev_id)
 	}
 	writel_relaxed(PWM_CH_INT(id), ddata->base + PWM_REG_INTSTS(id));
 	if (ddata->state == RMC_PRELOAD)
-		__pm_wakeup_event(ddata->remotectl_wake_lock, 1000);
-return IRQ_HANDLED;
+		pm_wakeup_event(ddata->dev, MSEC_PER_SEC);
+	return IRQ_HANDLED;
 }
 
 static irqreturn_t rockchip_pwm_irq_v4(int irq, void *dev_id)
@@ -491,8 +507,8 @@ static irqreturn_t rockchip_pwm_irq_v4(int irq, void *dev_id)
 	}
 
 	if (ddata->state == RMC_PRELOAD)
-		__pm_wakeup_event(ddata->remotectl_wake_lock, 1000);
-	
+		pm_wakeup_event(ddata->dev, MSEC_PER_SEC);
+
 	return ret;
 }
 
@@ -797,7 +813,7 @@ static int rk_pwm_sip_wakeup_init(struct platform_device *pdev)
 {
 	struct rkxx_remotectl_drvdata *ddata = platform_get_drvdata(pdev);
 	struct device_node *np = pdev->dev.of_node;
-	struct irq_desc *desc;
+	struct irq_data *irq_data;
 	int support_psci = 0;
 	int irq;
 	int hwirq;
@@ -814,7 +830,13 @@ static int rk_pwm_sip_wakeup_init(struct platform_device *pdev)
 	if (!support_psci)
 		goto end;
 	irq = ddata->irq;
-	hwirq = desc->irq_data.hwirq;
+	/* irq_to_desc() is not exported for modules on CONFIG_SPARSE_IRQ
+	 * kernels (only under CONFIG_KVM_BOOK3S_64_HV_MODULE); use the
+	 * exported irq_get_irq_data() instead. */
+	irq_data = irq_get_irq_data(irq);
+	if (!irq_data || !irq_data->domain)
+		goto end;
+	hwirq = irq_data->hwirq;
 	ret = sip_smc_remotectl_config(REMOTECTL_SET_IRQ, hwirq);
 	if (ret) {
 		dev_err(&pdev->dev, "set irq err, set support_psci to 0 !!\n");
@@ -883,11 +905,11 @@ static int rk_pwm_probe(struct platform_device *pdev)
 	int irq;
 	int ret;
 	int i, j;
-	int cpu_id;
+	int cpu_id = 0;
 	int pwm_id;
 	int pwm_freq;
 
-	pr_err(".. rk pwm remotectl v2.0 init\n");
+	dev_info(&pdev->dev, "rk pwm remotectl v2.0 init\n");
 	id = of_match_device(rk_pwm_of_match, &pdev->dev);
 	if (!id)
 		return -EINVAL;
@@ -903,6 +925,7 @@ static int rk_pwm_probe(struct platform_device *pdev)
 	if (!ddata)
 		return -ENOMEM;
 
+	ddata->dev = &pdev->dev;
 	ddata->pwm_data = id->data;
 	ddata->state = RMC_PRELOAD;
 	ddata->temp_period = 0;
@@ -980,7 +1003,11 @@ static int rk_pwm_probe(struct platform_device *pdev)
 	of_property_read_u32(np, "handle_cpu_id", &cpu_id);
 	ddata->handle_cpu_id = cpu_id;
 	DBG("remotectl: handle cpu id=0x%x\n", cpu_id);
-	rk_remotectl_parse_ir_keys(pdev);
+	ret = rk_remotectl_parse_ir_keys(pdev);
+	if (ret) {
+		dev_err(&pdev->dev, "failed to parse IR key tables: %d\n", ret);
+		return ret;
+	}
 	tasklet_init(&ddata->remote_tasklet, rk_pwm_remotectl_do_something,
 		     (unsigned long)ddata);
 	for (j = 0; j < num; j++) {
@@ -997,13 +1024,15 @@ static int rk_pwm_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "register input device err, ret=%d\n", ret);
 	input_set_capability(input, EV_KEY, KEY_WAKEUP);
 	device_init_wakeup(&pdev->dev, 1);
-	enable_irq_wake(irq);
+	ret = enable_irq_wake(irq);
+	if (ret)
+		dev_err(&pdev->dev, "failed to enable IRQ wake: %d\n", ret);
+	else
+		ddata->irq_wake_enabled = true;
 	timer_setup(&ddata->timer, rk_pwm_remotectl_timer, 0);
-	ddata->remotectl_wake_lock = wakeup_source_register(&pdev->dev, "rockchip_pwm_remote");
-
 	cpumask_clear(&cpumask);
 	cpumask_set_cpu(cpu_id, &cpumask);
-	irq_set_affinity_hint(irq, &cpumask);
+	irq_set_affinity(irq, &cpumask);
 	ret = devm_request_irq(&pdev->dev, irq, ddata->pwm_data->funcs.irq_handler,
 			       irq_flags, "pwm_rc", ddata);
 	if (ret) {
@@ -1030,13 +1059,40 @@ static int rk_pwm_probe(struct platform_device *pdev)
 end:
 	return 0;
 error_irq:
-	wakeup_source_unregister(ddata->remotectl_wake_lock);
+	/* undo the wakeup setup from the success path above */
+	if (ddata->irq_wake_enabled)
+		disable_irq_wake(irq);
+	device_init_wakeup(&pdev->dev, 0);
 	return ret;
 }
 
 static void rk_pwm_remove(struct platform_device *pdev)
 {
-	DBG("rk pwm remove!\n");
+	struct rkxx_remotectl_drvdata *ddata = platform_get_drvdata(pdev);
+
+	/* Quiesce our capture engine first, then drop our IRQ handler.
+	 * The v1 path registers with IRQF_SHARED, so the line must not
+	 * be disabled globally - devm_free_irq() removes only our
+	 * handler and synchronises any in-flight execution.
+	 * The tasklet is scheduled from the IRQ handlers, so it has to
+	 * be killed after they are gone. */
+	if (ddata->pwm_data->pwm_version >= 4) {
+		writel_relaxed(CAP_LPR_INT_EN(false) | CAP_HPR_INT_EN(false) |
+			       PWR_INT_EN(false),
+			       ddata->base + PWM_REG_INT_EN_V4);
+		writel_relaxed(PWM_EN(false) | PWM_CLK_EN(false),
+			       ddata->base + PWM_REG_ENABLE_V4);
+	} else {
+		writel_relaxed(PWM_DISABLE,
+			       ddata->base + PWM_REG_CTRL);
+		ddata->pwm_data->funcs.int_ctrl(pdev, 0);
+	}
+	if (ddata->irq_wake_enabled)
+		disable_irq_wake(ddata->irq);
+	devm_free_irq(&pdev->dev, ddata->irq, ddata);
+	tasklet_kill(&ddata->remote_tasklet);
+	timer_delete_sync(&ddata->timer);
+	device_init_wakeup(&pdev->dev, 0);
 }
 
 static int remotectl_suspend(struct device *dev)
@@ -1049,11 +1105,14 @@ static int remotectl_suspend(struct device *dev)
 	if (ddata->pwm_pwrkey_capture) {
 		ddata->pwrkey_wakeup = 0;
 		ddata->pwm_data->funcs.int_ctrl(pdev, IR_SUSPEND_MODE);
-		rk_pwm_clk_ctrl_v4(pdev, IR_SUSPEND_MODE);
+		/* rk_pwm_clk_ctrl_v4() only touches the v4 register
+		 * layout; never poke v1 (legacy) registers with it */
+		if (ddata->pwm_data->pwm_version >= 4)
+			rk_pwm_clk_ctrl_v4(pdev, IR_SUSPEND_MODE);
 	}
 	cpumask_clear(&cpumask);
 	cpumask_set_cpu(cpu, &cpumask);
-	irq_set_affinity_hint(ddata->irq, &cpumask);
+	irq_set_affinity(ddata->irq, &cpumask);
 	return 0;
 }
 
@@ -1067,7 +1126,7 @@ static int remotectl_resume(struct device *dev)
 
 	cpumask_clear(&cpumask);
 	cpumask_set_cpu(ddata->handle_cpu_id, &cpumask);
-	irq_set_affinity_hint(ddata->irq, &cpumask);
+	irq_set_affinity(ddata->irq, &cpumask);
 	if (ddata->support_psci) {
 		/*
 		 * loop wakeup state
@@ -1078,7 +1137,9 @@ static int remotectl_resume(struct device *dev)
 			rk_pwm_wakeup(ddata->input);
 	}  else if (ddata->pwm_pwrkey_capture) {
 		ddata->pwm_data->funcs.int_ctrl(pdev, IR_WORK_MODE);
-		rk_pwm_clk_ctrl_v4(pdev, IR_WORK_MODE);
+		/* see remotectl_suspend(): v4 registers only */
+		if (ddata->pwm_data->pwm_version >= 4)
+			rk_pwm_clk_ctrl_v4(pdev, IR_WORK_MODE);
 		if (ddata->pwrkey_wakeup == 0)
 			return 0;
 		ddata->pwrkey_wakeup = 0;
@@ -1107,12 +1168,12 @@ static struct platform_driver rk_pwm_driver = {
 		.pm = &remotectl_pm_ops,
 #endif
 	},
+	.probe = rk_pwm_probe,
 	.remove = rk_pwm_remove,
 	.shutdown = rk_pwm_remotectl_shutdown,
 };
 
-module_platform_driver_probe(rk_pwm_driver, rk_pwm_probe);
+module_platform_driver(rk_pwm_driver);
 
+MODULE_DESCRIPTION("Rockchip PWM remote control (IR) driver");
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Rockchip PWM Remote Control Driver");
-
